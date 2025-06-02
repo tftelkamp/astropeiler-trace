@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <math.h>
+#include <string.h>
 
 #include <vrt/vrt_string.h>
 #include <vrt/vrt_types.h>
@@ -276,6 +277,8 @@ int main() {
 
             memset(data_buffer, 0, sizeof(data_buffer));
 
+            get_update(sockfd);
+
             int unix_time_from_jd = round((jd - 2440587.5)*86400.0);
 
             // Debug time
@@ -283,14 +286,15 @@ int main() {
             // printf("JD: %lf, ", (jd - 2440587.5)*86400.0 );            
             // printf("JD: %d\n", unix_time_from_jd );            
 
+            if (VERBOSE)
+                printf("Update time (local/api): %d/%d\n", (int)time(NULL), unix_time_from_jd);
+
             pc.fields.integer_seconds_timestamp = unix_time_from_jd;
             pc.fields.fractional_seconds_timestamp = 0; // tbd
 
             pc.body = data_buffer;
             pc.header.packet_count = packet_count;
             packet_count = (packet_count + 1) % 16;
-
-            get_update(sockfd);
            
             data_buffer[0] = M_PI*azimuth/180.0;
             data_buffer[1] = M_PI*elevation/180.0;
