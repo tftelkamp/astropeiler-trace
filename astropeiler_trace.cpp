@@ -6,18 +6,46 @@
 #include <time.h>
 #include <math.h>
 
-#include <curl/curl.h>
-
 #include <vrt/vrt_string.h>
 #include <vrt/vrt_types.h>
 #include <vrt/vrt_write.h>
 
+#include <assert.h>
 #include <zmq.h>
 
-#include <boost/property_tree/ptree.hpp>
-#include <boost/property_tree/json_parser.hpp>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 
-namespace pt = boost::property_tree;
+#define VERBOSE 0
+
+// VRT update time in ms
+#define UPDATE_TIME 100
+
+#define HOST "192.168.200.81"
+#define PORTNUM 4000
+
+#define BUFFER_SIZE 4096
+#define LINE_BUFFER_SIZE 4096
+
+int in_dict = 0;
+bool end_of_dict = false;
+char key[64];
+double value;
+
+float azimuth;
+float elevation;
+float azimuth_offset;
+float elevation_offset;
+float azimuth_error;
+float elevation_error;
+float azimuth_tar;
+float elevation_tar;
+float ra;
+float dec;
+float ra_tar;
+float dec_tar;
+double jd;
 
 static bool stop_signal_called = false;
 
@@ -26,23 +54,131 @@ void sig_int_handler(int)
     stop_signal_called = true;
 }
 
-static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp)
-{
-    ((std::string*)userp)->append((char*)contents, size * nmemb);
-    return size * nmemb;
-}
-
-std::string curlDownload(CURL* curl){
-
-    CURLcode res;
-    std::string readBuffer;
-
-    if (curl) {
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-        res = curl_easy_perform(curl);
+void set_variable(char* key, double value) {
+    if (strcmp(key, "AZ_ACT")==0) {
+        azimuth = value;
+        if (VERBOSE)
+            printf("Azimuth current: %lf\n", azimuth);
+    } else if (strcmp(key, "EL_ACT")==0) {
+        elevation = value;
+        if (VERBOSE)
+            printf("Elevation current: %lf\n", elevation);
+    } else if (strcmp(key, "RA_ACT")==0) {
+        ra = value;
+        if (VERBOSE)
+            printf("RA current: %lf\n", ra);
+    } else if (strcmp(key, "DEC_ACT")==0) {
+        dec = value;
+        if (VERBOSE)
+            printf("DEC current: %lf\n", dec);
+    } else if (strcmp(key, "RA_TAR")==0) {
+        ra_tar = value;
+        if (VERBOSE)
+            printf("RA target: %lf\n", ra_tar);
+    } else if (strcmp(key, "DEC_TAR")==0) {
+        dec_tar = value;
+        if (VERBOSE)
+            printf("DEC target: %lf\n", dec_tar);
+    } if (strcmp(key, "AZ_OFFSET")==0) {
+        azimuth_offset = value;
+        if (VERBOSE)
+            printf("Azimuth offset: %lf\n", azimuth_offset);
+    } else if (strcmp(key, "EL_OFFSET")==0) {
+        elevation_offset = value;
+        if (VERBOSE)
+            printf("Elevation offset: %lf\n", elevation_offset);
+    } if (strcmp(key, "AZ_TAR")==0) {
+        azimuth_tar = value;
+        if (VERBOSE)
+            printf("Azimuth target: %lf\n", azimuth_tar);
+    } else if (strcmp(key, "EL_TAR")==0) {
+        elevation_tar = value;
+        if (VERBOSE)
+            printf("Elevation target: %lf\n", elevation_tar);
+    } else if (strcmp(key, "JD")==0) {
+        jd = value;
+        if (VERBOSE)
+            printf("JD: %lf\n", jd);
     }
-    return readBuffer;
 }
+
+void parse_pickle(char* line) {
+
+    if (strncmp(line, "(dp", 3) == 0) {
+        in_dict = 1;
+        return;
+    }
+    if (!in_dict) return;
+
+    if (line[0] == 'S' || line[1] == 'S') {
+        // String key: S'key'
+        char* start = strchr(line, '\'') + 1;
+        char* end = strchr(start, '\'');
+        size_t len = end - start;
+        if (len > 0 && len < LINE_BUFFER_SIZE) {
+            strncpy(key, start, len);
+            key[len] = '\0';
+        }
+    } else if (line[0] == 'F') {
+        // Float value: F88.0
+        sscanf(line + 1, "%lf", &value);
+        // printf("Parsed key-value: %s = %lf\n", key, value);
+        set_variable(key, value);
+    } else if (line[0] == '.' || line[1] == '.') {
+        // End of pickle
+        // printf("end of pickle\n");
+        in_dict = 0;
+        end_of_dict = true;
+        return;
+    }   
+}
+
+void get_update(int sockfd) {
+
+    const char *command = "???";
+
+    // Send command
+    if (send(sockfd, command, strlen(command), 0) < 0) {
+        perror("Error sending");
+        close(sockfd);
+        exit(EXIT_FAILURE);
+    }
+
+    char buffer[BUFFER_SIZE];
+    char line_buf[LINE_BUFFER_SIZE];
+
+    int line_len = 0;
+    in_dict = 0;
+    end_of_dict = false;
+
+    ssize_t bytes_received;
+    while (!end_of_dict && (bytes_received = recv(sockfd, buffer, sizeof(buffer)-1, 0)) > 0) {
+        buffer[bytes_received] = '\0';  // Null-terminate
+        // printf("%s", buffer);
+
+        for (ssize_t i = 0; i < bytes_received; i++) {
+            char c = buffer[i];
+            if (line_len < LINE_BUFFER_SIZE - 1) {
+                line_buf[line_len++] = c;
+            }
+
+            if (c == '\n') {
+                line_buf[line_len] = '\0';  // Null-terminate the line
+                // printf("Received line: %s", line_buf);
+                line_len = 0;  // Reset line buffer
+                parse_pickle(line_buf);
+            }
+        }
+
+        if (line_len > 0) {
+            // Handle trailing line with no newline
+            line_buf[line_len] = '\0';
+            // printf("Final partial line: %s\n", line_buf);
+            parse_pickle(line_buf);
+        }
+    }
+}
+
 
 int main() {
 
@@ -82,20 +218,47 @@ int main() {
 
     uint8_t packet_count = 0;
 
-    CURL* curl;
-    curl = curl_easy_init();
+    const char *hostname = HOST;
+    int port = PORTNUM;
 
-    std::string readBuffer;
-    std::string myLink = "https://api.astropeiler.de/25m";
+    // Resolve hostname
+    struct hostent *server = gethostbyname(hostname);
+    if (!server) {
+        fprintf(stderr, "Error: No such host %s\n", hostname);
+        exit(EXIT_FAILURE);
+    }
 
-    curl_easy_setopt(curl, CURLOPT_URL, myLink.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+    // Create socket
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        perror("Error opening socket");
+        exit(EXIT_FAILURE);
+    }
+
+     // Set up server address struct
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    memcpy(&server_addr.sin_addr.s_addr, server->h_addr, server->h_length);
+    server_addr.sin_port = htons(port);
+
+    // Connect to server
+    if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Error connecting");
+        close(sockfd);
+        exit(EXIT_FAILURE);
+    } else {
+        printf("Connected\n");
+    }
+
+    // Set timeout to 100ms
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 100000;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
 
     std::signal(SIGINT, &sig_int_handler);
     std::cout << "Press Ctrl + C to stop." << std::endl;
-
-    // Create ptree root
-    pt::ptree root;
 
     auto start_time = std::chrono::steady_clock::now();
 
@@ -107,41 +270,28 @@ int main() {
         const auto now = std::chrono::steady_clock::now();
 
         const auto time_since_last_context = now - last_update;
-        if (time_since_last_context > std::chrono::milliseconds(250)) {
+        if (time_since_last_context > std::chrono::milliseconds(100)) {
 
             last_update = now;
 
             memset(data_buffer, 0, sizeof(data_buffer));
 
-            pc.fields.integer_seconds_timestamp = (int)time(NULL); // use current time
+            int unix_time_from_jd = round((jd - 2440587.5)*86400.0);
+
+            // Debug time
+            // printf("Unix: %d, ",(int)time(NULL));
+            // printf("JD: %lf, ", (jd - 2440587.5)*86400.0 );            
+            // printf("JD: %d\n", unix_time_from_jd );            
+
+            pc.fields.integer_seconds_timestamp = unix_time_from_jd;
             pc.fields.fractional_seconds_timestamp = 0; // tbd
 
             pc.body = data_buffer;
             pc.header.packet_count = packet_count;
             packet_count = (packet_count + 1) % 16;
 
-            readBuffer = curlDownload(curl);
-            // std::cout << readBuffer << std::endl;
-
-            // Load the json string in this ptree
-            std::istringstream is(readBuffer);
-            pt::read_json(is, root);
-
-            float azimuth = root.get<float>("AZ_ACT", 0);
-            float elevation = root.get<float>("EL_ACT", 0);
-
-            float azimuth_offset = root.get<float>("AZ_OFF", 0);
-            float elevation_offset = root.get<float>("EL_OFF", 0);
-
-            float ra = root.get<float>("RA_ACT", 0);
-            float dec = root.get<float>("DEC_ACT", 0);
-
-            float ra_tar = root.get<float>("RA_TAR", 0);
-            float dec_tar = root.get<float>("DEC_TAR", 0);
-
-            float jd = root.get<float>("JD", 0);
-            float mjd = root.get<float>("MJD", 0);
-
+            get_update(sockfd);
+           
             data_buffer[0] = M_PI*azimuth/180.0;
             data_buffer[1] = M_PI*elevation/180.0;
 
@@ -168,16 +318,13 @@ int main() {
             zmq_msg_send(&msg, zmq_server, 0);
             zmq_msg_close(&msg);
 
-            // Debug
-            // printf("Unix: %d, ",(int)time(NULL));
-            // printf("RA: %f, ", ra);
-            // printf("JD: %.4f, ", (jd - 2440587.5)*86400.0 );            
-            // printf("MJD: %f\n", (mjd - 2440587.5 + 2400000.5)*86400.0 );          
         }
+
+        usleep(1000);
 
     }
 
-    curl_easy_cleanup(curl);
+    close(sockfd);
     std::cout << "Done." << std::endl;
     return 0;
 }
